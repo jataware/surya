@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 def get_batch_size():
     batch_size = settings.RECOGNITION_BATCH_SIZE
+    print(settings.TORCH_DEVICE_MODEL)
     if batch_size is None:
         batch_size = 32
         if settings.TORCH_DEVICE_MODEL == "mps":
@@ -20,7 +21,6 @@ def get_batch_size():
         if settings.TORCH_DEVICE_MODEL == "cuda":
             batch_size = 256
     return batch_size
-
 
 def batch_recognition(images: List, languages: List[List[str]], model, processor, batch_size=None):
     assert all([isinstance(image, Image.Image) for image in images])
@@ -36,11 +36,11 @@ def batch_recognition(images: List, languages: List[List[str]], model, processor
     output_text = []
     confidences = []
 
-    dec_config = model.config.decoder
+    dec_config  = model.config.decoder
     layer_count = dec_config.decoder_layers
-    kv_heads = dec_config.kv_heads
-    head_dim = int(dec_config.d_model / dec_config.decoder_attention_heads)
-    min_val = torch.finfo(model.dtype).min
+    kv_heads    = dec_config.kv_heads
+    head_dim    = int(dec_config.d_model / dec_config.decoder_attention_heads)
+    min_val     = torch.finfo(model.dtype).min
 
     if settings.RECOGNITION_STATIC_CACHE:
         # We'll re-use these for all batches to avoid recopying
@@ -58,16 +58,14 @@ def batch_recognition(images: List, languages: List[List[str]], model, processor
         initial_kv_mask = torch.zeros((batch_size, 1, 1, 1), dtype=model.dtype, device=model.device)
         initial_attn_mask = torch.zeros((batch_size, 1, settings.RECOGNITION_MAX_LANGS + 1, settings.RECOGNITION_MAX_LANGS + 1), dtype=model.dtype, device=model.device)
 
-    processed_batches = processor(text=[""] * len(images), images=images, lang=languages)
-
+    # processed_batches = processor(text=[""] * len(images), images=images, lang=languages)
     for i in tqdm(range(0, len(images), batch_size), desc="Recognizing Text"):
-        batch_langs = languages[i:i+batch_size]
-        has_math = ["_math" in lang for lang in batch_langs]
-
-        batch_pixel_values = processed_batches["pixel_values"][i:i+batch_size]
-        batch_langs = processed_batches["langs"][i:i+batch_size]
-        max_lang_len = max([len(lang) for lang in batch_langs])
-
+        batch_langs        = languages[i:i+batch_size]
+        has_math           = ["_math" in lang for lang in batch_langs]
+        processed_batches  = processor(text=[""]*batch_size, images=images[i:i+batch_size], lang=languages[i:i+batch_size])
+        batch_pixel_values = processed_batches["pixel_values"]
+        batch_langs        = processed_batches["langs"]
+        max_lang_len       = max([len(lang) for lang in batch_langs])
         # Pad languages to max length if needed, to ensure we can convert to a tensor
         for lang_idx in range(len(batch_langs)):
             lang_len = len(batch_langs[lang_idx])
@@ -76,7 +74,7 @@ def batch_recognition(images: List, languages: List[List[str]], model, processor
 
         batch_decoder_input = [[model.config.decoder_start_token_id] + lang for lang in batch_langs]
         current_batch_size = len(batch_pixel_values)
-
+        
         batch_langs = torch.tensor(np.stack(batch_langs, axis=0), dtype=torch.long, device=model.device)
         batch_pixel_values = torch.tensor(np.stack(batch_pixel_values, axis=0), dtype=model.dtype, device=model.device)
         batch_decoder_input = torch.tensor(np.stack(batch_decoder_input, axis=0), dtype=torch.long, device=model.device)
