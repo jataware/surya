@@ -24,7 +24,7 @@ def batch_recognition2(images: List, languages: List[List[str]], model, processo
     for l in languages:
         assert len(l) <= settings.RECOGNITION_MAX_LANGS, f"OCR only supports up to {settings.RECOGNITION_MAX_LANGS} languages per image, you passed {l}."
 
-    images = [image.convert("RGB") for image in images]
+    images     = [image.convert("RGB") for image in images]
     batch_size = len(images)
 
     dec_config  = model.config.decoder
@@ -127,7 +127,6 @@ def batch_recognition2(images: List, languages: List[List[str]], model, processo
     y_hat = processor.tokenizer.batch_decode(batch_predictions)
     y_hat = [truncate_repetitions(dt) for dt in y_hat]
     y_hat = [fix_math(text) if math and contains_math(text) else text for text, math in zip(y_hat, has_math)]
-
     return full_logits, y_hat
 
 
@@ -156,11 +155,11 @@ def _collate_fn(batch):
     return slices, texts, langs
 
 def main():
-    train = True
-    batch_size = 8
+    train      = True
+    batch_size = 32
     rec_model, rec_processor = load_model(), load_processor()
-    dataset = load_dataset("vikp/rec_bench")['train']
-    subset_size = 100  # Define the size of the subset
+    dataset        = load_dataset("vikp/rec_bench")['train']
+    subset_size    = 100  # Define the size of the subset
     subset_dataset = dataset.select(range(subset_size))    
 
     ds = OCRDataset(subset_dataset)
@@ -168,13 +167,16 @@ def main():
     
     if train:
         rec_model.train()
-        optimizer = optim.Adam(rec_model.parameters(), lr=1e-5)
+
+        optimizer = optim.Adam(rec_model.parameters(), lr=1e-6)
+        for param in rec_model.encoder.parameters():
+            param.requires_grad = True
     else:
         rec_model.eval()
 
     results = {'acc': [], 'loss': [], 'words': []}
     for X, y, langs in dl:
-        
+
         # get forward pass        
         logits, y_hat = batch_recognition2(X, langs, rec_model, rec_processor)
         
@@ -204,7 +206,7 @@ def main():
         if train:
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(rec_model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(rec_model.parameters(), max_norm=0.1)
             optimizer.step()
 
         results['acc'].append((correct/total))
