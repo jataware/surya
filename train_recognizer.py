@@ -1,3 +1,5 @@
+
+
 from typing import List
 from PIL import Image
 from tqdm import tqdm
@@ -16,6 +18,9 @@ from surya.model.recognition.model import load_model
 from surya.model.recognition.processor import load_processor
 
 from datasets import load_dataset
+
+torch.cuda.empty_cache()
+torch.cuda.reset_peak_memory_stats()
 
 def batch_recognition2(images: List, languages: List[List[str]], model, processor):
     assert all([isinstance(image, Image.Image) for image in images])
@@ -154,13 +159,45 @@ def _collate_fn(batch):
     langs = [lang[0] for lang in langs]
     return slices, texts, langs
 
+def reset_model(model):
+    for layer in model.modules():
+        if hasattr(layer, 'reset_parameters'):
+            layer.reset_parameters()
+
+def hook_fn(grad):
+    if torch.isnan(grad).any() or torch.isinf(grad).any():
+        print("NaN or Inf detected in gradients")
+        return torch.zeros_like(grad)
+
+def print_grad_stats(model):
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grad = param.grad
+            print(f"{name}:")
+            print(f"  Mean: {grad.mean().item():.5e}")
+            print(f"  Std Dev: {grad.std().item():.5e}")
+            print(f"  Max: {grad.max().item():.5e}")
+            print(f"  Min: {grad.min().item():.5e}")
+            print(f"  Norm: {grad.norm().item():.5e}")
+
 def main():
     train      = True
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
     batch_size = 32
     rec_model, rec_processor = load_model(), load_processor()
+    reset_model(rec_model)
+
     dataset        = load_dataset("vikp/rec_bench")['train']
     subset_size    = 100  # Define the size of the subset
     subset_dataset = dataset.select(range(subset_size))    
+
+    scaler = torch.cuda.amp.GradScaler()
+
 
     ds = OCRDataset(subset_dataset)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=_collate_fn)
@@ -168,12 +205,16 @@ def main():
     if train:
         rec_model.train()
 
-        optimizer = optim.Adam(rec_model.parameters(), lr=1e-6)
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, rec_model.parameters()), lr=1e-6)
         for param in rec_model.encoder.parameters():
-            param.requires_grad = True
+            param.requires_grad = False
+            
+        # for name, param in rec_model.named_parameters():
+        #     if param.requires_grad:
+        #         param.register_hook(lambda grad, name=name: hook_fn(grad))
     else:
         rec_model.eval()
-
+        
     results = {'acc': [], 'loss': [], 'words': []}
     for X, y, langs in dl:
 
@@ -186,27 +227,34 @@ def main():
         # align shapes of logits and y_tok
         y_tok_max_len = max([len(yy) for yy in y_tok]) - 1
         max_len = max(logits.size(1), y_tok_max_len)
+
         if logits.size(1) < max_len:
             logits = F.pad(logits, (0, 0, 0, max_len - logits.size(1)), value=rec_processor.tokenizer.eos_id)
-        
+    
         y_tok = [[1] + yy[2:] + [rec_processor.tokenizer.eos_id] * (max_len - len(yy) + 1) for yy in y_tok]
         y_tok = torch.tensor(y_tok, dtype=torch.long, device=rec_model.device)
         mask  = (y_tok != rec_processor.tokenizer.eos_id).float()
-    
-    
+                
         loss = F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]), 
             y_tok.reshape(-1), 
-            ignore_index=rec_processor.tokenizer.eos_id
-        )
+            # ignore_index=rec_processor.tokenizer.eos_id
+            reduction='sum'
 
+        )
+        print('0', loss)
         correct = ((logits.argmax(-1) == y_tok) * mask).sum().item()
-        total   = mask.sum().item()
+        total = mask.sum().item()
+        print(correct, total)
+        print(y[0], y_hat[0])
         
         if train:
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(rec_model.parameters(), max_norm=0.1)
+            
+            # print_grad_stats(rec_model)
+
             optimizer.step()
 
         results['acc'].append((correct/total))
