@@ -6,7 +6,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-import torchvision.transforms.functional as TF
 import torch.optim as optim
 
 from surya.settings import settings
@@ -18,146 +17,200 @@ from surya.model.recognition.processor import load_processor
 
 from datasets import load_dataset
 
-def get_batch_size():
-    batch_size = settings.RECOGNITION_BATCH_SIZE
-    if batch_size is None:
-        batch_size = 32
-        if settings.TORCH_DEVICE_MODEL == "mps":
-            batch_size = 64 # 12GB RAM max
-        if settings.TORCH_DEVICE_MODEL == "cuda":
-            batch_size = 256
-    return batch_size
-
-def compute_loss_from_scores(scores, tokenized_texts, processor, vocab_size):
-    logits = torch.stack([s[:, token_id].unsqueeze(1) for s, token_id in zip(scores, tokenized_texts.unbind(dim=1))], dim=1)
-    loss = F.cross_entropy(logits.view(-1, vocab_size), tokenized_texts.view(-1), ignore_index=processor.tokenizer.pad_token_id)
-    return loss
-
-def batch_recognition(images: List, languages: List[List[str]], model, processor, texts=None, train=False):
+def batch_recognition2(images: List, languages: List[List[str]], model, processor):
     assert all([isinstance(image, Image.Image) for image in images])
     assert len(images) == len(languages)
-    batch_size = get_batch_size()
+
+    for l in languages:
+        assert len(l) <= settings.RECOGNITION_MAX_LANGS, f"OCR only supports up to {settings.RECOGNITION_MAX_LANGS} languages per image, you passed {l}."
 
     images = [image.convert("RGB") for image in images]
-    loss_fn = torch.nn.CrossEntropyLoss()
+    batch_size = len(images)
 
-    if train:
-        model.train()
-        optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    else:
-        model.eval()
+    dec_config  = model.config.decoder
+    layer_count = dec_config.decoder_layers
+    kv_heads    = dec_config.kv_heads
+    head_dim    = int(dec_config.d_model / dec_config.decoder_attention_heads)
+    min_val     = torch.finfo(model.dtype).min
 
-    output_text = []
-    confidences = []
-    losses      = []
-    total_acc, total_words = 0, 0
-    for i in tqdm(range(0, len(images), batch_size), desc="Recognizing Text"):
-        batch_langs  = languages[i:i+batch_size]
-        has_math     = ["_math" in lang for lang in batch_langs]
-        batch_images = images[i:i+batch_size]
-        model_inputs = processor(text=[""] * len(batch_langs), images=batch_images, lang=batch_langs)
+    initial_kv_mask = torch.zeros((batch_size, 1, 1, 1), dtype=model.dtype, device=model.device)
+    initial_attn_mask = torch.zeros((batch_size, 1, settings.RECOGNITION_MAX_LANGS + 1, settings.RECOGNITION_MAX_LANGS + 1), dtype=model.dtype, device=model.device)
+
+    batch_langs        = languages
+    has_math           = ["_math" in lang for lang in batch_langs]
+    processed_batches  = processor(text=[""]*batch_size, images=images, lang=languages)
+    batch_pixel_values = processed_batches["pixel_values"]
+    batch_langs        = processed_batches["langs"]
+    max_lang_len       = max([len(lang) for lang in batch_langs])
+    
+    for lang_idx in range(len(batch_langs)):
+        lang_len = len(batch_langs[lang_idx])
+        if lang_len < max_lang_len:
+            batch_langs[lang_idx] = [processor.tokenizer.pad_id] * (max_lang_len - lang_len) + batch_langs[lang_idx]
+
+    batch_decoder_input = [[model.config.decoder_start_token_id] + lang for lang in batch_langs]
+    current_batch_size = len(batch_pixel_values)
+    
+    batch_langs         = torch.tensor(np.stack(batch_langs, axis=0), dtype=torch.long, device=model.device)
+    batch_pixel_values  = torch.tensor(np.stack(batch_pixel_values, axis=0), dtype=model.dtype, device=model.device)
+    batch_decoder_input = torch.tensor(np.stack(batch_decoder_input, axis=0), dtype=torch.long, device=model.device)
+
+    token_count           = 0
+    inference_token_count = batch_decoder_input.shape[-1]
+    batch_predictions     = [[] for _ in range(current_batch_size)]
+
+    kv_mask = initial_kv_mask[:current_batch_size]
+    kv_mask.fill_(0)
+
+    attention_mask = initial_attn_mask[:current_batch_size, :, :inference_token_count, :inference_token_count]
+
+    decoder_cache = [None] * layer_count
+
+    encoder_outputs = None
+    encoder_cache = [None] * layer_count
+    all_done = torch.zeros(current_batch_size, dtype=torch.bool, device=model.device)
+
+    all_logits = []
+
+    while token_count < settings.RECOGNITION_MAX_TOKENS:
+        is_prefill = token_count == 0
+        return_dict = model(
+            decoder_input_ids=batch_decoder_input,
+            decoder_attention_mask=attention_mask,
+            decoder_self_kv_cache=None if is_prefill else decoder_cache,
+            decoder_cross_kv_cache=None if is_prefill else encoder_cache,
+            decoder_past_token_count=token_count,
+            decoder_langs=batch_langs,
+            pixel_values=batch_pixel_values,
+            encoder_outputs=encoder_outputs,
+            return_dict=True,
+        )
+
+        logits = return_dict["logits"][:current_batch_size]
         
-        batch_pixel_values  = model_inputs["pixel_values"]
-        batch_langs         = model_inputs["langs"]
-        batch_decoder_input = [[model.config.decoder_start_token_id] + lang for lang in batch_langs]
-
-        batch_langs         = torch.from_numpy(np.array(batch_langs, dtype=np.int64)).to(model.device)
-        batch_pixel_values  = torch.tensor(np.array(batch_pixel_values), dtype=model.dtype).to(model.device)
-        batch_decoder_input = torch.from_numpy(np.array(batch_decoder_input, dtype=np.int64)).to(model.device)
-
-        with torch.set_grad_enabled(train):
-            return_dict = model.generate(
-                pixel_values      = batch_pixel_values,
-                decoder_input_ids = batch_decoder_input,
-                decoder_langs     = batch_langs,
-                eos_token_id      = processor.tokenizer.eos_id,
-                max_new_tokens    = settings.RECOGNITION_MAX_TOKENS,
-                output_scores     = True,
-                return_dict_in_generate = True
-            )
-            generated_ids = return_dict["sequences"]
-
-            # Find confidence scores
-            scores          = return_dict["scores"] # Scores is a tuple, one per new sequence position.  Each tuple element is bs x vocab_size
-            sequence_scores = torch.zeros(generated_ids.shape[0])
-            sequence_lens   = torch.where(
-                generated_ids > processor.tokenizer.eos_id,
-                torch.ones_like(generated_ids),
-                torch.zeros_like(generated_ids)
-            ).sum(axis=-1).cpu()
-            
-            prefix_len = generated_ids.shape[1] - len(scores) # Length of passed in tokens (bos, langs)
-            for token_idx, score in enumerate(scores):
-                probs     = F.softmax(score, dim=-1)
-                max_probs = torch.max(probs, dim=-1).values
-                max_probs = torch.where(
-                    generated_ids[:, token_idx + prefix_len] <= processor.tokenizer.eos_id,
-                    torch.zeros_like(max_probs),
-                    max_probs
-                ).cpu()
-                sequence_scores += max_probs
-            sequence_scores /= sequence_lens
-
-            if texts is not None:
-                
-                
-                logits = torch.stack(scores, dim=1)  # stack to shape [batch_size, sequence_length, vocab_size]
-                batch_texts     = texts[i:i+batch_size]
-                tokenized_texts = processor.tokenizer(batch_texts, languages[i:i+batch_size])["input_ids"]
-                tokenized_texts = [text + [1] * (logits.shape[1]+2 - len(text)) for text in tokenized_texts]
-                tokenized_texts = torch.tensor(tokenized_texts, dtype=torch.long).to(model.device)
-                tokenized_texts = tokenized_texts[:, 2:]
-                
-                loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tokenized_texts.reshape(-1))
-                losses.append(loss.item())
-                total_acc += (logits.argmax(-1) == tokenized_texts).sum().item()
-                total_words += tokenized_texts.numel()                
-                if train:
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                    
+        all_logits.append(logits)
+        preds = torch.argmax(logits[:, -1], dim=-1)
+        done = (preds == processor.tokenizer.eos_id) | (preds == processor.tokenizer.pad_id)
+        all_done = all_done | done
         
-                        
-        detected_text = processor.tokenizer.batch_decode(generated_ids)
-        detected_text = [truncate_repetitions(dt) for dt in detected_text]
-        detected_text = [fix_math(text) if math and contains_math(text) else text for text, math in zip(detected_text, has_math)]
-        output_text.extend(detected_text)
-        confidences.extend(sequence_scores.tolist())
-   
-    total_acc = total_acc / total_words
+        if is_prefill:
+            encoder_outputs = (return_dict["encoder_last_hidden_state"],)
 
-    return {"text": output_text, "confidence": confidences, "loss": sum(losses) / len(losses) if losses else None, 'acc': total_acc}
+        if all_done.all():
+            break
+
+        past_key_values = return_dict["past_key_values"]
+        token_range = torch.arange(token_count, token_count + inference_token_count, device=model.device)
+
+        for layer_idx, layer in enumerate(past_key_values):
+            if is_prefill:
+                encoder_cache[layer_idx] = layer[1]
+
+            if is_prefill:
+                decoder_cache[layer_idx] = layer[0]
+            else:
+                decoder_cache[layer_idx] = torch.cat([decoder_cache[layer_idx], layer[0]], dim=3)
+
+        batch_decoder_input = preds.unsqueeze(1)
+        kv_mask = torch.cat([kv_mask, torch.zeros((current_batch_size, 1, 1, inference_token_count), dtype=model.dtype, device=model.device)], dim=-1)
+
+        attention_mask = kv_mask
+
+        for j, (pred, status) in enumerate(zip(preds, all_done)):
+            if not status:
+                batch_predictions[j].append(int(pred))
+
+        token_count += inference_token_count
+        inference_token_count = batch_decoder_input.shape[-1]
+
+    full_logits = torch.cat(all_logits, dim=1)
+    y_hat = processor.tokenizer.batch_decode(batch_predictions)
+    y_hat = [truncate_repetitions(dt) for dt in y_hat]
+    y_hat = [fix_math(text) if math and contains_math(text) else text for text, math in zip(y_hat, has_math)]
+
+    return full_logits, y_hat
+
 
 class OCRDataset(Dataset):
-    def __init__(self, dataset, transform=None):
+    def __init__(self, dataset):
         self.dataset = dataset
+        self.indices = [(i, j) for i, item in enumerate(tqdm(dataset)) for j in range(len(item['bboxes']))]
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self.indices)
 
     def __getitem__(self, idx):
-        item = self.dataset[idx]
+        image_idx, bbox_idx = self.indices[idx]
+        item  = self.dataset[image_idx]
         image = item['image']
-        bboxes = item['bboxes']
-        texts = item['text']
-        lang = item['language']
-        slices = slice_bboxes_from_image(image, bboxes)
-        return slices, texts, [[lang]]*len(slices)
-
+        bbox  = [item['bboxes'][bbox_idx]]
+        text  = item['text'][bbox_idx]
+        lang  = item['language']
+        slice = slice_bboxes_from_image(image, bbox)
+        return slice, text, [[lang]]
+    
 def _collate_fn(batch):
     slices, texts, langs = zip(*batch)
-    slices = [item for sublist in slices for item in sublist]
-    texts = [item for sublist in texts for item in sublist]
-    langs = [item for sublist in langs for item in sublist]
+    slices = [slice[0] for slice in slices]
+    langs = [lang[0] for lang in langs]
     return slices, texts, langs
 
-rec_model, rec_processor = load_model(), load_processor()
-dataset = load_dataset("vikp/rec_bench")['train']
+def main():
+    train = True
+    batch_size = 8
+    rec_model, rec_processor = load_model(), load_processor()
+    dataset = load_dataset("vikp/rec_bench")['train']
+    subset_size = 100  # Define the size of the subset
+    subset_dataset = dataset.select(range(subset_size))    
 
-ds = OCRDataset(dataset)
-dl = DataLoader(ds, batch_size=10, shuffle=True, collate_fn=_collate_fn) 
-for slices, texts, lang in dl:
-    out = batch_recognition(slices, lang, rec_model, rec_processor, texts)
-    print(out['loss'], out['acc'])
+    ds = OCRDataset(subset_dataset)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=_collate_fn)
     
+    if train:
+        rec_model.train()
+        optimizer = optim.Adam(rec_model.parameters(), lr=1e-5)
+    else:
+        rec_model.eval()
+
+    results = {'acc': [], 'loss': [], 'words': []}
+    for X, y, langs in dl:
+        
+        # get forward pass        
+        logits, y_hat = batch_recognition2(X, langs, rec_model, rec_processor)
+        
+        # tokenize ground truth texts
+        y_tok = rec_processor.tokenizer(y, langs)["input_ids"]
+        
+        # align shapes of logits and y_tok
+        y_tok_max_len = max([len(yy) for yy in y_tok]) - 1
+        max_len = max(logits.size(1), y_tok_max_len)
+        if logits.size(1) < max_len:
+            logits = F.pad(logits, (0, 0, 0, max_len - logits.size(1)), value=rec_processor.tokenizer.eos_id)
+        
+        y_tok = [[1] + yy[2:] + [rec_processor.tokenizer.eos_id] * (max_len - len(yy) + 1) for yy in y_tok]
+        y_tok = torch.tensor(y_tok, dtype=torch.long, device=rec_model.device)
+        mask  = (y_tok != rec_processor.tokenizer.eos_id).float()
+    
+    
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]), 
+            y_tok.reshape(-1), 
+            ignore_index=rec_processor.tokenizer.eos_id
+        )
+
+        correct = ((logits.argmax(-1) == y_tok) * mask).sum().item()
+        total   = mask.sum().item()
+        
+        if train:
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(rec_model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+        results['acc'].append((correct/total))
+        results['loss'].append(loss.detach().item())
+        
+        print('Accuracy:', np.mean(results['acc']), 'Loss:', np.mean(results['loss']))
+
+if __name__ == "__main__":
+    main()
