@@ -80,6 +80,7 @@ def batch_recognition2(images: List, languages: List[List[str]], model, processo
 
     all_logits = []
     final_logits = None
+    
     # Main token generation loop
     for token_count in range(settings.RECOGNITION_MAX_TOKENS):
         is_prefill = token_count == 0
@@ -164,10 +165,10 @@ def _collate_fn(batch):
     slices = [slice[0] for slice in slices]
     langs  = [lang[0] for lang in langs]
     return slices, texts, langs
-
+            
 def main():
 
-    train       = True
+    train       = False
     batch_size  = 16
     subset_size = 100  # Define the size of the subset
     
@@ -176,6 +177,7 @@ def main():
     torch.cuda.reset_peak_memory_stats()
 
     rec_model, rec_processor = load_model(), load_processor()
+    
     dataset        = load_dataset("vikp/rec_bench")['train']
     subset_dataset = dataset.select(range(subset_size))    
 
@@ -184,16 +186,26 @@ def main():
     
     if train:
         rec_model.train()
+        rec_model = rec_model.to(dtype=torch.float32)
+
         for param in rec_model.encoder.parameters():
             param.requires_grad = False
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, rec_model.parameters()), lr=1e-6)
+        for param in rec_model.decoder.parameters():
+            param.requires_grad = True
+        # for param in rec_model.decoder.lm_head.parameters():
+        #     param.requires_grad = True
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, rec_model.parameters()), lr=1e-5)
+
+        for module in rec_model.modules():
+            if isinstance(module, torch.nn.BatchNorm2d):
+                module.eval()
 
     else:
         rec_model.eval()
         
     results = {'acc': [], 'loss': [], 'words': []}
     for X, y, langs in dl:
-
+            
         # get forward pass        
         logits, y_hat = batch_recognition2(X, langs, rec_model, rec_processor)
         
@@ -202,26 +214,28 @@ def main():
         
         # align shapes of logits and y_tok
         y_tok_max_len = max([len(yy) for yy in y_tok]) - 1
-        max_len = max(logits.size(1), y_tok_max_len)
+        max_len       = max(logits.size(1), y_tok_max_len)
+        if logits.size(1) < max_len:
+            logits = F.pad(logits, (0, 0, 0, max_len - logits.size(1)))
         
         y_tok = [[1] + yy[2:] + [rec_processor.tokenizer.eos_id] * (max_len - len(yy) + 1) for yy in y_tok]
         y_tok = torch.tensor(y_tok, dtype=torch.long, device=rec_model.device)
         mask  = (y_tok != rec_processor.tokenizer.eos_id).float()
-
+        
         loss = F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]), 
             y_tok.reshape(-1), 
             ignore_index=rec_processor.tokenizer.eos_id
         )
         correct = ((logits.argmax(-1) == y_tok) * mask).sum().item()
-        total = mask.sum().item()
+        total   = mask.sum().item()
         
         if train:
             optimizer.zero_grad()
             loss.backward()
-            
-            torch.nn.utils.clip_grad_norm_(rec_model.parameters(), max_norm=0.1)
+            torch.nn.utils.clip_grad_norm_(rec_model.parameters(), max_norm=0.5)
             optimizer.step()
+                        
 
         results['acc'].append((correct/total))
         results['loss'].append(loss.detach().item())
