@@ -20,7 +20,6 @@ from surya.model.recognition.processor import load_processor
 from datasets import load_dataset
 
 torch.cuda.empty_cache()
-torch.cuda.reset_peak_memory_stats()
 
 def batch_recognition2(images: List, languages: List[List[str]], model, processor):
     # Validate input types and constraints
@@ -171,10 +170,10 @@ def main():
     train       = False
     batch_size  = 16
     subset_size = 100  # Define the size of the subset
+    print('gonna run')
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
 
     rec_model, rec_processor = load_model(), load_processor()
     
