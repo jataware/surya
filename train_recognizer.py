@@ -4,11 +4,12 @@ from typing import List
 from PIL import Image
 from tqdm import tqdm
 import numpy as np
+from rich import print
 
 import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
 import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, random_split
 
 from surya.settings import settings
 from surya.input.processing import slice_bboxes_from_image
@@ -16,12 +17,12 @@ from surya.postprocessing.math.latex import fix_math, contains_math
 from surya.postprocessing.text import truncate_repetitions
 from surya.model.recognition.model import load_model
 from surya.model.recognition.processor import load_processor
-
+from surya.languages import CODE_TO_LANGUAGE
 from datasets import load_dataset
 
 torch.cuda.empty_cache()
 
-def batch_recognition2(images: List, languages: List[List[str]], model, processor):
+def batch_recognition_fp(images: List, languages: List[List[str]], model, processor):
     # Validate input types and constraints
     assert all([isinstance(image, Image.Image) for image in images])
     assert len(images) == len(languages)
@@ -165,48 +166,13 @@ def _collate_fn(batch):
     langs  = [lang[0] for lang in langs]
     return slices, texts, langs
             
-def main():
-
-    train       = False
-    batch_size  = 16
-    subset_size = 100  # Define the size of the subset
-    print('gonna run')
+def one_epoch(dl, rec_model, rec_processor, optimizer, train=False):
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.cuda.empty_cache()
-
-    rec_model, rec_processor = load_model(), load_processor()
-    
-    dataset        = load_dataset("vikp/rec_bench")['train']
-    subset_dataset = dataset.select(range(subset_size))    
-
-    ds = OCRDataset(subset_dataset)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=_collate_fn)
-    
-    if train:
-        rec_model.train()
-        rec_model = rec_model.to(dtype=torch.float32)
-
-        for param in rec_model.encoder.parameters():
-            param.requires_grad = False
-        for param in rec_model.decoder.parameters():
-            param.requires_grad = True
-        # for param in rec_model.decoder.lm_head.parameters():
-        #     param.requires_grad = True
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, rec_model.parameters()), lr=1e-5)
-
-        for module in rec_model.modules():
-            if isinstance(module, torch.nn.BatchNorm2d):
-                module.eval()
-
-    else:
-        rec_model.eval()
-        
-    results = {'acc': [], 'loss': [], 'words': []}
-    for X, y, langs in dl:
-            
+    results = {'correct': {}, 'total': {}, 'loss': []}
+    for X, y, langs in tqdm(dl):
+                    
         # get forward pass        
-        logits, y_hat = batch_recognition2(X, langs, rec_model, rec_processor)
+        logits, y_hat = batch_recognition_fp(X, langs, rec_model, rec_processor)
         
         # tokenize ground truth texts
         y_tok = rec_processor.tokenizer(y, langs)["input_ids"]
@@ -216,30 +182,89 @@ def main():
         max_len       = max(logits.size(1), y_tok_max_len)
         if logits.size(1) < max_len:
             logits = F.pad(logits, (0, 0, 0, max_len - logits.size(1)))
-        
         y_tok = [[1] + yy[2:] + [rec_processor.tokenizer.eos_id] * (max_len - len(yy) + 1) for yy in y_tok]
         y_tok = torch.tensor(y_tok, dtype=torch.long, device=rec_model.device)
         mask  = (y_tok != rec_processor.tokenizer.eos_id).float()
         
+        # compute loss / acc
         loss = F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]), 
             y_tok.reshape(-1), 
             ignore_index=rec_processor.tokenizer.eos_id
         )
-        correct = ((logits.argmax(-1) == y_tok) * mask).sum().item()
-        total   = mask.sum().item()
+        correct = ((logits.argmax(-1) == y_tok) * mask).sum(axis=1)        
+        total   = mask.sum(axis=1)
         
+        # backprop
         if train:
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(rec_model.parameters(), max_norm=0.5)
             optimizer.step()
-                        
-
-        results['acc'].append((correct/total))
+        
+        # do per language + overall acc
+        for i, lang in enumerate([lang[0] for lang in langs]):
+            if lang not in list(results['correct'].keys()):
+                results['correct'][lang] = correct[i].item()
+                results['total'][lang] = total[i].item()
+            else: 
+                results['correct'][lang] += correct[i].item()
+                results['total'][lang] += total[i].item()
+    
         results['loss'].append(loss.detach().item())
-        print('Accuracy:', np.mean(results['acc']), 'Loss:', np.mean(results['loss']))
-        print("=====================================")
+    
+    results['accuracy'] = {CODE_TO_LANGUAGE[lang]: results['correct'][lang] / results['total'][lang] for lang in results['total'].keys()}
+    return results, rec_model, optimizer
 
+
+def main():
+
+    batch_size  = 10
+    subset_size = 100  # Define the size of the subset
+    languages_sub = ['ru', 'ar', 'en', 'es', 'bg']
+    validation_split = 0.5
+
+    torch.cuda.empty_cache()
+    rec_model, rec_processor = load_model(), load_processor()
+    
+    # get dataset + subset
+    dataset          = load_dataset("vikp/rec_bench")['train']
+    if languages_sub is None:
+        languages_sub = list(set([entry['language'] for entry in dataset]))
+    subset_idx = [i for i, entry in enumerate(dataset) if entry['language'] in languages_sub]
+    if len(subset_idx) > subset_size:
+        subset_idx = np.random.choice(subset_idx, subset_size, replace=False)
+    subset_dataset = dataset.select(subset_idx)    
+    
+    # split train / val
+    val_size = int(len(subset_dataset) * validation_split)
+    train_size = len(subset_dataset) - val_size
+    ds_train, ds_valid = random_split(subset_dataset, [train_size, val_size])
+
+    dl_train = DataLoader(OCRDataset(ds_train), batch_size=batch_size, shuffle=True, collate_fn=_collate_fn)
+    dl_valid = DataLoader(OCRDataset(ds_valid), batch_size=batch_size, shuffle=False, collate_fn=_collate_fn)
+    
+    rec_model = rec_model.to(dtype=torch.float32)
+    for param in rec_model.encoder.parameters():
+        param.requires_grad = False
+    for param in rec_model.decoder.parameters():
+        param.requires_grad = True
+    # for param in rec_model.decoder.lm_head.parameters():
+    #     param.requires_grad = True
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, rec_model.parameters()), lr=1e-5)
+
+    for module in rec_model.modules():
+        if isinstance(module, torch.nn.BatchNorm2d):
+            module.eval()
+
+    # Train / Validate
+    for epoch in range(10):
+        print(f"Epoch {epoch}")
+        results_valid, _, _ = one_epoch(dl_valid, rec_model, rec_processor, optimizer, train=False)
+        print("Valid: loss:", np.mean(results_valid['loss']), "Accuracy:", results_valid['accuracy'])
+
+        results_train, rec_model, optimizer = one_epoch(dl_train, rec_model, rec_processor, optimizer, train=True)
+        print("Train: loss:", np.mean(results_train['loss']), "Accuracy:", results_train['accuracy'])
+            
 if __name__ == "__main__":
     main()
