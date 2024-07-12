@@ -1,10 +1,11 @@
 
-
+import os
 from typing import List
 from PIL import Image
 from tqdm import tqdm
 import numpy as np
 from rich import print
+from glob import glob
 
 import torch
 import torch.optim as optim
@@ -160,6 +161,23 @@ class OCRDataset(Dataset):
         slice = slice_bboxes_from_image(image, bbox)
         return slice, text, [[lang]]
     
+    
+class LeadingZerosDataset(Dataset):
+    def __init__(self, data_path, langs):
+        
+        self.langs = langs
+        self.data_paths = glob(os.path.join(data_path, "*.png"))
+
+    def __len__(self):
+        return len(self.data_paths)
+    
+    def __getitem__(self, idx):
+        img = Image.open(self.data_paths[idx])
+        text = os.path.basename(self.data_paths[idx]).split(".")[0]
+        lang = np.random.choice(self.langs)
+        return [img], text, [[lang]]
+    
+    
 def _collate_fn(batch):
     slices, texts, langs = zip(*batch)
     slices = [slice[0] for slice in slices]
@@ -170,6 +188,7 @@ def one_epoch(dl, rec_model, rec_processor, optimizer, train=False):
     
     results = {'correct': {}, 'total': {}, 'loss': []}
     for X, y, langs in tqdm(dl):
+        
                     
         # get forward pass        
         logits, y_hat = batch_recognition_fp(X, langs, rec_model, rec_processor)
@@ -196,7 +215,7 @@ def one_epoch(dl, rec_model, rec_processor, optimizer, train=False):
         total   = mask.sum(axis=1)
         
         # backprop
-        if train:
+        if train == True:
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(rec_model.parameters(), max_norm=0.5)
@@ -217,33 +236,94 @@ def one_epoch(dl, rec_model, rec_processor, optimizer, train=False):
     return results, rec_model, optimizer
 
 
-def main():
+def get_experiment(experiment_name):
+    
+    if experiment_name == 'leading_zeros_base':
+        
+        languages_sub = ['ru', 'ar', 'en', 'es', 'bg']
+        validation_split = 0.5
+        batch_size = 10
+        num_workers = 8
+        dataset = LeadingZerosDataset("generated_images", languages_sub)
+        val_size = int(len(dataset) * validation_split)
+        train_size = len(dataset) - val_size
+        ds_train, ds_valid = random_split(dataset, [train_size, val_size])
+        
+        dl_train = DataLoader(ds_train, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=_collate_fn)
+        dl_valid = DataLoader(ds_valid, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=_collate_fn)
 
-    batch_size  = 10
-    subset_size = 100  # Define the size of the subset
-    languages_sub = ['ru', 'ar', 'en', 'es', 'bg']
-    validation_split = 0.5
+        dls = [
+            {'name': 'valid1', 'dl': dl_valid, 'train': False},
+            {'name': 'train', 'dl': dl_train, 'train': True}
+            ]
+        
+    elif experiment_name  == 'rec_bench':
+        
+        languages_sub = ['ru', 'ar', 'en', 'es', 'bg']
+        validation_split = 0.5
+        subset_size = 1000
+        batch_size = 10
+        num_workers = 8
+        dataset = load_dataset("vikp/rec_bench")['train']
+        subset_idx = [i for i, entry in enumerate(dataset) if entry['language'] in languages_sub]
+        if len(subset_idx) > subset_size:
+            subset_idx = np.random.choice(subset_idx, subset_size, replace=False)
+        subset_dataset = dataset.select(subset_idx)
+        val_size = int(len(subset_dataset) * validation_split)
+        train_size = len(subset_dataset) - val_size
+        ds_train, ds_valid = random_split(subset_dataset, [train_size, val_size])
+
+        dl_train = DataLoader(OCRDataset(ds_train), batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=_collate_fn)
+        dl_valid = DataLoader(OCRDataset(ds_valid), batch_size=batch_size, shuffle=False,num_workers=num_workers, collate_fn=_collate_fn)
+        
+        dls = [
+            {'name': 'valid', 'dl': dl_valid, 'train': False},
+            {'name': 'train', 'dl': dl_train, 'train': True}
+            ]
+    
+    elif experiment_name == 'leading_zeros_degrade':
+        
+        languages_sub = ['ru', 'ar', 'en', 'es', 'bg']
+        validation_split = 0.5
+        batch_size  = 10
+        num_workers = 8
+        dataset     = LeadingZerosDataset("generated_images", languages_sub)
+        val_size    = int(len(dataset) * validation_split)
+        train_size  = len(dataset) - val_size
+        ds_train, ds_valid = random_split(dataset, [train_size, val_size])
+        
+        dl_train = DataLoader(ds_train, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=_collate_fn)
+        dl_valid0 = DataLoader(ds_valid, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=_collate_fn)
+
+        dataset = load_dataset("vikp/rec_bench")['train']
+        subset = {}
+        for i, entry in enumerate(dataset):
+            if entry['language'] in languages_sub:
+                subset[entry['language']] = subset.get(entry['language'], []) + [i]
+        subset_idx = [s[0:10] for s in subset.values()]
+        subset_idx = [i for s in subset_idx for i in s]
+        dataset = dataset.select(subset_idx)
+        dl_valid1 = DataLoader(OCRDataset(dataset), batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=_collate_fn)
+        
+        dls = [
+            {'name': 'valid_leading0s', 'dl': dl_valid0, 'train': False},
+            {'name': 'valid_recbench', 'dl': dl_valid1, 'train': False},
+            {'name': 'valid_recbench2', 'dl': dl_valid1, 'train': False},
+            {'name': 'train', 'dl': dl_train, 'train': True}
+            ]
+
+    return dls
+
+
+def main():
+    
+    experiment_name = 'leading_zeros_degrade'
 
     torch.cuda.empty_cache()
     rec_model, rec_processor = load_model(), load_processor()
     
-    # get dataset + subset
-    dataset          = load_dataset("vikp/rec_bench")['train']
-    if languages_sub is None:
-        languages_sub = list(set([entry['language'] for entry in dataset]))
-    subset_idx = [i for i, entry in enumerate(dataset) if entry['language'] in languages_sub]
-    if len(subset_idx) > subset_size:
-        subset_idx = np.random.choice(subset_idx, subset_size, replace=False)
-    subset_dataset = dataset.select(subset_idx)    
-    
-    # split train / val
-    val_size = int(len(subset_dataset) * validation_split)
-    train_size = len(subset_dataset) - val_size
-    ds_train, ds_valid = random_split(subset_dataset, [train_size, val_size])
+    dls = get_experiment(experiment_name)
 
-    dl_train = DataLoader(OCRDataset(ds_train), batch_size=batch_size, shuffle=True, collate_fn=_collate_fn)
-    dl_valid = DataLoader(OCRDataset(ds_valid), batch_size=batch_size, shuffle=False, collate_fn=_collate_fn)
-    
     rec_model = rec_model.to(dtype=torch.float32)
     for param in rec_model.encoder.parameters():
         param.requires_grad = False
@@ -260,11 +340,10 @@ def main():
     # Train / Validate
     for epoch in range(10):
         print(f"Epoch {epoch}")
-        results_valid, _, _ = one_epoch(dl_valid, rec_model, rec_processor, optimizer, train=False)
-        print("Valid: loss:", np.mean(results_valid['loss']), "Accuracy:", results_valid['accuracy'])
-
-        results_train, rec_model, optimizer = one_epoch(dl_train, rec_model, rec_processor, optimizer, train=True)
-        print("Train: loss:", np.mean(results_train['loss']), "Accuracy:", results_train['accuracy'])
+        
+        for dl in dls:
+            results, rec_model, optimizer = one_epoch(dl['dl'], rec_model, rec_processor, optimizer, train=dl['train'])
+            print(f"{dl['name']}: loss:", np.mean(results['loss']), "Accuracy:", results['accuracy'])
             
 if __name__ == "__main__":
     main()
