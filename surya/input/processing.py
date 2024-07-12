@@ -27,6 +27,24 @@ def get_total_splits(image_size, processor):
         return num_splits
     return 1
 
+def prepare_image(img, processor):
+    new_size = (processor.size["width"], processor.size["height"])
+    img.thumbnail(new_size, Image.Resampling.LANCZOS) # Shrink largest dimension to fit new size
+    img = img.resize(new_size, Image.Resampling.LANCZOS) # Stretch smaller dimension to fit new size
+    img = np.asarray(img, dtype=np.uint8)
+    img = processor(img)["pixel_values"][0]
+    img = torch.from_numpy(img)
+    return img
+
+def prepare_map(img, processor):
+    new_size = (processor.size["width"], processor.size["height"])
+    img.thumbnail(new_size, Image.Resampling.LANCZOS) # Shrink largest dimension to fit new size
+    img = img.resize(new_size, Image.Resampling.LANCZOS) # Stretch smaller dimension to fit new size
+    img = np.asarray(img, dtype=np.uint8)
+    img = torch.from_numpy(img)
+    img = img[:,:,0]
+    img = torch.stack([img, torch.zeros(img.size())], dim=0)
+    return img
 
 def split_image(img, processor):
     # This will not modify/return the original image - it will either crop, or copy the image

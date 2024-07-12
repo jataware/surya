@@ -308,7 +308,6 @@ def get_experiment(experiment_name):
         dls = [
             {'name': 'valid_leading0s', 'dl': dl_valid0, 'train': False},
             {'name': 'valid_recbench', 'dl': dl_valid1, 'train': False},
-            {'name': 'valid_recbench2', 'dl': dl_valid1, 'train': False},
             {'name': 'train', 'dl': dl_train, 'train': True}
             ]
 
