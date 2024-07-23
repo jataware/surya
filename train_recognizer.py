@@ -313,6 +313,7 @@ def parse_args():
 def main():
 
     args = parse_args()
+    print(args)
     os.makedirs(args.model_path, exist_ok=True)
     
     torch.cuda.empty_cache()
