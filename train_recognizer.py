@@ -288,7 +288,7 @@ def get_experiment(experiment_name, data_path='/home/paperspace/zeek/data/leadin
         for i, entry in enumerate(dataset):
             if entry['language'] in languages_sub:
                 subset[entry['language']] = subset.get(entry['language'], []) + [i]
-        subset_idx = [s[0:30] for s in subset.values()]
+        subset_idx = [s[0:10] for s in subset.values()]
         subset_idx = [i for s in subset_idx for i in s]
         dataset = dataset.select(subset_idx)
         dl_valid1 = DataLoader(OCRDataset(dataset), batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=_collate_fn)
@@ -339,13 +339,17 @@ def main():
         print(f"Epoch {epoch}")
         
         for dl in dls:
+            if dl['train']:
+                rec_model.train()
+            else:
+                rec_model.eval()
             results, rec_model, optimizer = one_epoch(dl['dl'], rec_model, rec_processor, optimizer, train=dl['train'])
             print(f"{dl['name']}: loss:", np.mean(results['loss']), "Accuracy:", results['accuracy'])
             
-            if 'valid' in dl['name']:
-                if results['accuracy']['Arabic'] > best_acc:
-                    best_acc = results['accuracy']['Arabic']
-                    torch.save(rec_model.state_dict(), f"{args.model_path}/model_{epoch}.pt")
+            # if 'valid' in dl['name']:
+            #     if results['accuracy']['Arabic'] > best_acc:
+            #         best_acc = results['accuracy']['Arabic']
+            #         torch.save(rec_model.state_dict(), f"{args.model_path}/model_{epoch}.pt")
             
 if __name__ == "__main__":
     main()
