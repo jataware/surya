@@ -1,5 +1,6 @@
 
 import os
+import argparse
 from typing import List
 from PIL import Image
 from tqdm import tqdm
@@ -236,63 +237,50 @@ def one_epoch(dl, rec_model, rec_processor, optimizer, train=False):
     return results, rec_model, optimizer
 
 
-def get_experiment(experiment_name):
+def get_experiment(experiment_name, data_path='/home/paperspace/zeek/data/leading_0s/', n_train=500):
     
+    batch_size = 10
+    num_workers = 8
+    languages_sub = ['ru', 'ar', 'en', 'es', 'bg']
+        
     if experiment_name == 'leading_zeros_base':
         
-        languages_sub = ['ru', 'ar', 'en', 'es', 'bg']
-        validation_split = 0.5
-        batch_size = 10
-        num_workers = 8
-        dataset = LeadingZerosDataset("generated_images", languages_sub)
-        val_size = int(len(dataset) * validation_split)
-        train_size = len(dataset) - val_size
-        ds_train, ds_valid = random_split(dataset, [train_size, val_size])
-        
+
+        dataset = LeadingZerosDataset(data_path, languages_sub)
+        assert n_train < len(dataset), "n_train must be less than the size of the dataset"
+        ds_train, ds_valid = random_split(dataset, [n_train, len(dataset) - n_train])     
         dl_train = DataLoader(ds_train, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=_collate_fn)
         dl_valid = DataLoader(ds_valid, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=_collate_fn)
 
         dls = [
-            {'name': 'valid1', 'dl': dl_valid, 'train': False},
-            {'name': 'train', 'dl': dl_train, 'train': True}
-            ]
+            {'name': 'valid_leading0s', 'dl': dl_valid, 'train': False},
+            {'name': 'train_leading0s', 'dl': dl_train, 'train': True}
+        ]
         
     elif experiment_name  == 'rec_bench':
         
-        languages_sub = ['ru', 'ar', 'en', 'es', 'bg']
-        validation_split = 0.5
         subset_size = 1000
-        batch_size = 10
-        num_workers = 8
-        dataset = load_dataset("vikp/rec_bench")['train']
-        subset_idx = [i for i, entry in enumerate(dataset) if entry['language'] in languages_sub]
+        dataset     = load_dataset("vikp/rec_bench")['train']
+        subset_idx  = [i for i, entry in enumerate(dataset) if entry['language'] in languages_sub]
         if len(subset_idx) > subset_size:
             subset_idx = np.random.choice(subset_idx, subset_size, replace=False)
         subset_dataset = dataset.select(subset_idx)
-        val_size = int(len(subset_dataset) * validation_split)
-        train_size = len(subset_dataset) - val_size
-        ds_train, ds_valid = random_split(subset_dataset, [train_size, val_size])
-
+        
+        ds_train, ds_valid = random_split(subset_dataset, [n_train, len(subset_dataset) - n_train])
         dl_train = DataLoader(OCRDataset(ds_train), batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=_collate_fn)
         dl_valid = DataLoader(OCRDataset(ds_valid), batch_size=batch_size, shuffle=False,num_workers=num_workers, collate_fn=_collate_fn)
         
         dls = [
-            {'name': 'valid', 'dl': dl_valid, 'train': False},
-            {'name': 'train', 'dl': dl_train, 'train': True}
-            ]
+            {'name': 'valid_recbench', 'dl': dl_valid, 'train': False},
+            {'name': 'train_recbench', 'dl': dl_train, 'train': True}
+        ]
     
     elif experiment_name == 'leading_zeros_degrade':
         
-        languages_sub = ['ru', 'ar', 'en', 'es', 'bg']
-        validation_split = 0.5
-        batch_size  = 10
-        num_workers = 8
-        dataset     = LeadingZerosDataset("generated_images", languages_sub)
-        val_size    = int(len(dataset) * validation_split)
-        train_size  = len(dataset) - val_size
-        ds_train, ds_valid = random_split(dataset, [train_size, val_size])
+        dataset     = LeadingZerosDataset(data_path, languages_sub)
+        ds_train, ds_valid = random_split(dataset, [n_train, len(dataset) - n_train])     
         
-        dl_train = DataLoader(ds_train, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=_collate_fn)
+        dl_train  = DataLoader(ds_train, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=_collate_fn)
         dl_valid0 = DataLoader(ds_valid, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=_collate_fn)
 
         dataset = load_dataset("vikp/rec_bench")['train']
@@ -300,28 +288,36 @@ def get_experiment(experiment_name):
         for i, entry in enumerate(dataset):
             if entry['language'] in languages_sub:
                 subset[entry['language']] = subset.get(entry['language'], []) + [i]
-        subset_idx = [s[0:10] for s in subset.values()]
+        subset_idx = [s[0:30] for s in subset.values()]
         subset_idx = [i for s in subset_idx for i in s]
         dataset = dataset.select(subset_idx)
         dl_valid1 = DataLoader(OCRDataset(dataset), batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=_collate_fn)
         
         dls = [
             {'name': 'valid_leading0s', 'dl': dl_valid0, 'train': False},
-            {'name': 'valid_recbench', 'dl': dl_valid1, 'train': False},
-            {'name': 'train', 'dl': dl_train, 'train': True}
-            ]
+            {'name': 'valid_recbench',  'dl': dl_valid1, 'train': False},
+            {'name': 'train_leading0s', 'dl': dl_train, 'train': True}
+        ]
 
     return dls
 
 
-def main():
-    
-    experiment_name = 'leading_zeros_degrade'
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--experiment_name', type=str, default='leading_zeros_base')
+    parser.add_argument('--data_path',       type=str, default='/home/paperspace/zeek/data/leading_0s/')
+    parser.add_argument('--model_path',      type=str, default='/home/paperspace/zeek/models/recognizer')
+    parser.add_argument('--n_train',         type=int, default=500)
+    return parser.parse_args()
 
+def main():
+
+    args = parse_args()
+    os.makedirs(args.model_path, exist_ok=True)
+    
     torch.cuda.empty_cache()
     rec_model, rec_processor = load_model(), load_processor()
-    
-    dls = get_experiment(experiment_name)
+    dls = get_experiment(args.experiment_name, args.data_path, args.n_train)
 
     rec_model = rec_model.to(dtype=torch.float32)
     for param in rec_model.encoder.parameters():
@@ -337,12 +333,18 @@ def main():
             module.eval()
 
     # Train / Validate
-    for epoch in range(10):
+    best_acc = 0
+    for epoch in range(5):
         print(f"Epoch {epoch}")
         
         for dl in dls:
             results, rec_model, optimizer = one_epoch(dl['dl'], rec_model, rec_processor, optimizer, train=dl['train'])
             print(f"{dl['name']}: loss:", np.mean(results['loss']), "Accuracy:", results['accuracy'])
+            
+            if 'valid' in dl['name']:
+                if results['accuracy']['Arabic'] > best_acc:
+                    best_acc = results['accuracy']['Arabic']
+                    torch.save(rec_model.state_dict(), f"{args.model_path}/model_{epoch}.pt")
             
 if __name__ == "__main__":
     main()

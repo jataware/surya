@@ -6,6 +6,7 @@ import os
 import string
 import random
 import requests
+import argparse
 from tqdm import tqdm
 from PIL import Image, ImageDraw, ImageFont
 
@@ -49,11 +50,18 @@ def generate_and_save_images(num_images, save_dir):
         image = generate_text_image(text, font, font_size, 'white', text_color)
         filename = f"{save_dir}/{text}.png"
         image.save(filename)
+        
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--num_images', type=int, default=1000)
+    parser.add_argument('--save_dir', type=str, default='generated_images')
+    return parser.parse_args()
 
+# cli
+args = parse_args()
 
-
-# Generate and save 1000 images
-generate_and_save_images(1000, 'generated_images')
+# Generate and save images
+generate_and_save_images(args.num_images, args.save_dir)
 
 
 
